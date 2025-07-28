@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Google Profile Schema",
+  "type": "object",
+  "required": ["userId", "email", "timestamp", "profile", "metadata"],
+  "properties": {
+    "userId": {
+      "type": "string",
+      "description": "Google user identifier"
+    },
+    "email": {
+      "type": "string",
+      "format": "email",
+      "description": "User's email address"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "Timestamp of the data collection in milliseconds"
+    },
+    "profile": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "User's display name"
+        },
+        "locale": {
+          "type": "string",
+          "description": "User's locale setting"
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "properties": {
+        "percentUsed": {
+          "type": "number",
+          "description": "Percentage of storage used"
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["source", "collectionDate", "dataType"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "Source of the data"
+        },
+        "collectionDate": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Date when the data was collected"
+        },
+        "dataType": {
+          "type": "string",
+          "description": "Type of data collected"
+        }
+      }
+    }
+  }
+} 

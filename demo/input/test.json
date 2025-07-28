@@ -1,0 +1,12 @@
+{
+  "userId": "111",
+  "email": "test@opendatalabs.xyz",
+  "timestamp": 1742211639877,
+  "profile": { "name": "test test", "locale": "en" },
+  "storage": { "percentUsed": 1.67 },
+  "metadata": {
+    "source": "Google",
+    "collectionDate": "2025-03-17T11:40:39.877Z",
+    "dataType": "profile"
+  }
+}
