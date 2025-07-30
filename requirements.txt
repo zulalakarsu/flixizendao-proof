@@ -1,7 +1,8 @@
 pydantic
 pydantic-settings
 requests
-jsonschema
 web3
 psycopg2-binary
 sqlalchemy
+pandas
+cryptography

@@ -1,5 +1,11 @@
 FROM python:3.12-slim
 
+# Install system dependencies for cryptography
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install any Python dependencies your application needs, e.g.:
 RUN pip install --no-cache-dir requests
 

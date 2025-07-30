@@ -1,137 +1,234 @@
-import hashlib
-import json
 import logging
 import os
+import pandas as pd
+import datetime as dt
+import requests
+import tempfile
+from pathlib import Path
+from io import BytesIO
 
 from my_proof.models.proof_response import ProofResponse
 from my_proof.utils.blockchain import BlockchainClient
-from my_proof.utils.google import get_google_user
-from my_proof.utils.schema import validate_schema
 from my_proof.config import settings
+from my_proof.schemas.netflix_columns import (
+    VIEWING_REQUIRED, BILLING_REQUIRED, REQUIRED_THRESHOLD
+)
+from my_proof.utils.bloom_filter import BloomFilter, hash_csv_row, detect_new_rows
 
+
+# Define required and optional Netflix files
+REQUIRED_FILES = {
+    "ViewingActivity.csv": "netflix-viewing-activity"
+}
+
+OPTIONAL_FILES = {
+    "BillingHistory.csv": "netflix-billing-history"
+}
+
+# Minimum proof threshold
+PROOF_THRESHOLD = 0.5
 
 class Proof:
     def __init__(self):
         self.proof_response = ProofResponse(dlp_id=settings.DLP_ID)
+        self.errors: list[str] = []
         try:
             self.blockchain_client = BlockchainClient()
             self.blockchain_available = True
         except Exception as e:
-            logging.warning(f"Blockchain client initialization failed: {str(e)}")
+            logging.warning(f"Blockchain client init failed: {e}")
             self.blockchain_available = False
 
+    # ------------------------------------------------------------------ #
+    def _append_error(self, msg: str):
+        self.errors.append(msg)
+        logging.error(msg)
+
+    # ------------------------------------------------------------------ #
+    def _download_from_drive(self, file_id: str, access_token: str) -> bytes:
+        """Download encrypted file from Google Drive."""
+        try:
+            url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+            headers = {"Authorization": f"Bearer {access_token}"}
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            return response.content
+        except Exception as e:
+            raise Exception(f"Failed to download from Drive: {e}")
+
+    # ------------------------------------------------------------------ #
+    def _decrypt_file(self, encrypted_data: bytes, signature: str) -> bytes:
+        """Decrypt file using wallet signature."""
+        try:
+            # Import crypto utilities
+            from my_proof.utils.crypto import client_side_decrypt
+            
+            # Decrypt the data
+            decrypted_data = client_side_decrypt(encrypted_data, signature)
+            return decrypted_data
+        except Exception as e:
+            raise Exception(f"Failed to decrypt file: {e}")
+
+    # ------------------------------------------------------------------ #
     def generate(self) -> ProofResponse:
-        """Generate proofs for all input files."""
-        logging.info("Starting proof generation")
-        errors = []
+        logging.info("⇢ starting Netflix-CSV proof")
+        file_stats: dict[str, dict] = {}
 
-        # Fetch Google user info if token is provided
-        google_user = None
-        storage_user_hash = None
-        if settings.GOOGLE_TOKEN:
-            google_user = get_google_user()
-            if google_user:
-                storage_user_hash = hashlib.sha256(google_user.id.encode()).hexdigest()
-                if not google_user.verified_email:
-                    errors.append("UNVERIFIED_STORAGE_EMAIL")
-            else:
-                errors.append("UNVERIFIED_STORAGE_USER")
-        else:
-            logging.info("GOOGLE_TOKEN not set, skipping user verification")
+        # Get Drive credentials from environment
+        drive_file_id = os.getenv("DRIVE_FILE_ID")
+        drive_access_token = os.getenv("DRIVE_OAUTH_TOKEN")
+        wallet_signature = os.getenv("WALLET_SIGNATURE")
+        row_hashes_json = os.getenv("ROW_HASHES_JSON", "[]")  # Client-provided row hashes
 
-        # Get existing file count from blockchain if available
+        if not drive_file_id or not drive_access_token or not wallet_signature:
+            self._append_error("MISSING_DRIVE_CREDENTIALS")
+            self.proof_response.valid = False
+            return self.proof_response
+
+        # Duplicate-contribution guard
         if self.blockchain_available and settings.OWNER_ADDRESS:
-            existing_file_count = self.blockchain_client.get_contributor_file_count()
-            if existing_file_count > 0:
-                errors.append(f"DUPLICATE_CONTRIBUTION")
-        else:
-            logging.info("Skipping blockchain validation")
+            if self.blockchain_client.get_contributor_file_count() > 0:
+                self._append_error("DUPLICATE_CONTRIBUTION")
 
-        # Iterate through files and calculate data validity
-        for input_filename in os.listdir(settings.INPUT_DIR):
-            logging.info(f"Checking file: {input_filename}")
-            input_file = os.path.join(settings.INPUT_DIR, input_filename)
+        # -------------------------------------------------------------- #
+        try:
+            # Download encrypted file from Drive
+            logging.info(f"⇢ downloading encrypted file from Drive: {drive_file_id}")
+            encrypted_data = self._download_from_drive(drive_file_id, drive_access_token)
+            
+            # Decrypt the file
+            logging.info("⇢ decrypting file with wallet signature")
+            decrypted_data = self._decrypt_file(encrypted_data, wallet_signature)
+            
+            # Create temporary file for pandas processing
+            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as temp_file:
+                temp_file.write(decrypted_data)
+                temp_file_path = temp_file.name
 
-            if os.path.splitext(input_file)[1].lower() == '.json':
-                with open(input_file, 'r') as f:
-                    json_content = f.read()
-                    logging.info(f"Validating file: {json_content[:50]}...")
-                    input_data = json.loads(json_content)
-                    schema_type, schema_matches = validate_schema(input_data)
-                    if not schema_matches:
-                        errors.append(f"INVALID_SCHEMA")
-                        break
-                    
-                    # Verify the input data matches the Google profile
-                    if google_user:
-                        profile_matches = self._verify_profile_match(google_user, input_data)
-                        if not profile_matches:
-                            errors.append("PROFILE_MISMATCH")
-                            logging.error(f"Input profile data does not match Google profile")
-                    
-                    # Calculate proof-of-contribution scores
-                    self.proof_response.ownership = 1.0 if settings.OWNER_ADDRESS else 0.0
-                    self.proof_response.quality = 1.0 if schema_matches else 0.0
-                    self.proof_response.authenticity = 1.0 if google_user and schema_matches else 0.0
-                    self.proof_response.uniqueness = 1.0
+            try:
+                # Read CSV with pandas
+                df = pd.read_csv(temp_file_path)
+                
+                if df.empty or df.shape[1] < 3 or len(df) < 1:
+                    self._append_error(f"CSV_TOO_SMALL: Drive file (rows={len(df)}, cols={df.shape[1]})")
+                    return self.proof_response
 
-                    # Calculate overall score
-                    self.proof_response.score = (
-                        self.proof_response.quality * 0.4 + 
-                        self.proof_response.authenticity * 0.3 + 
-                        self.proof_response.uniqueness * 0.2 + 
-                        self.proof_response.ownership * 0.1
-                    )
+                header = {c.strip().lower() for c in df.columns}
+                # Note: For extra resiliency, could use: .str.lower().str.replace(" ", "_")
+                is_view = len(header & VIEWING_REQUIRED)  >= len(VIEWING_REQUIRED)  * REQUIRED_THRESHOLD
+                is_bill = len(header & BILLING_REQUIRED) >= len(BILLING_REQUIRED) * REQUIRED_THRESHOLD
+                if not (is_view or is_bill):
+                    self._append_error("UNRECOGNISED_CSV_STRUCTURE")
+                    return self.proof_response
 
-                    # Additional (public) properties to include in the proof about the data
-                    self.proof_response.attributes = {
-                        'schema_type': schema_type,
-                        'user_email': input_data.get('email'),
-                        'user_id': input_data.get('userId'),
-                        'profile_name': input_data.get('profile', {}).get('name'),
-                        'verified_with_oauth': google_user is not None
-                    }
-                    
-                    # Additional metadata about the proof, written onchain
-                    self.proof_response.metadata = {
-                        'schema_type': schema_type,
-                    }
-                    
-                    self.proof_response.valid = len(errors) == 0
-        
-        # Only include errors if there are any
-        if len(errors) > 0:
-            self.proof_response.attributes['errors'] = errors
+                # ---------- duplicate detection -------------------------------------- #
+                import json
+                try:
+                    client_hashes = json.loads(row_hashes_json)
+                    if not isinstance(client_hashes, list):
+                        client_hashes = []
+                except:
+                    client_hashes = []
+                
+                # Generate server-side hashes for verification
+                server_hashes = []
+                for _, row in df.iterrows():
+                    row_str = ",".join(str(val) for val in row.values)
+                    server_hashes.append(hash_csv_row(row_str))
+                
+                # Initialize Bloom filter (in practice, this would be loaded from persistent storage)
+                bloom_filter = BloomFilter(expected_elements=1000000, false_positive_rate=0.01)
+                
+                # Detect new vs duplicate rows
+                duplicate_stats = detect_new_rows(server_hashes, bloom_filter)
+                
+                # Verify client hashes match server hashes (basic integrity check)
+                hash_mismatch = len(client_hashes) != len(server_hashes)
+                if hash_mismatch:
+                    logging.warning(f"Hash count mismatch: client={len(client_hashes)}, server={len(server_hashes)}")
 
+                # ---------- metrics -------------------------------------- #
+                total_rows = len(df)
+                new_rows = duplicate_stats["new_rows"]
+                duplicate_rows = duplicate_stats["duplicate_rows"]
+                uniqueness_ratio = duplicate_stats["uniqueness_ratio"]
+                
+                non_null = 1.0 - df.isna().mean().mean()
+                # Guard against NaN non_null (when entire row is null)
+                if pd.isna(non_null):
+                    non_null = 0.0
+                
+                # Adjust volume bonus based on new rows only
+                volume_bonus = min(new_rows / 10_000, 0.50)
+                recency_bonus = 0.0
+                if is_view:
+                    col = next((c for c in df.columns if c.lower().startswith("start time")), None)
+                    if col and pd.api.types.is_datetime64_any_dtype(pd.to_datetime(df[col], errors="coerce")):
+                        recent_cut = dt.datetime(2020, 1, 1)
+                        if any(pd.to_datetime(df[col], errors="coerce") >= recent_cut):
+                            recency_bonus = 0.10
+
+                # Quality score now considers uniqueness
+                base_quality = non_null * 0.6
+                uniqueness_bonus = uniqueness_ratio * 0.3  # Reward for unique data
+                quality = round(min(base_quality + volume_bonus + recency_bonus + uniqueness_bonus, 1.0), 3)
+                
+                file_type = "netflix-viewing-activity" if is_view else "netflix-billing-history"
+
+                file_stats["drive_file"] = dict(
+                    rows=total_rows,
+                    new_rows=new_rows,
+                    duplicate_rows=duplicate_rows,
+                    uniqueness_ratio=round(uniqueness_ratio, 3),
+                    columns=list(df.columns),
+                    bytes=len(encrypted_data),
+                    file_type=file_type,
+                    quality=quality,
+                    drive_file_id=drive_file_id,
+                    hash_mismatch=hash_mismatch,
+                )
+
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_file_path)
+                except:
+                    pass
+
+        except Exception as e:
+            self._append_error(f"DRIVE_PROCESSING_ERROR: {e}")
+            return self.proof_response
+
+        # -------------------------------------------------------------- #
+        if not file_stats:
+            self._append_error("NO_VALID_CSV_FILES")
+
+        # Final decision ------------------------------------------------ #
+        self.proof_response.valid   = len(self.errors) == 0
+        self.proof_response.quality = max((s["quality"] for s in file_stats.values()), default=0.0)
+        self.proof_response.uniqueness   = 1.0
+        self.proof_response.ownership    = 1.0 if settings.OWNER_ADDRESS else 0.0
+        self.proof_response.score  = (
+              self.proof_response.quality   * 0.6
+            + self.proof_response.uniqueness* 0.3
+            + self.proof_response.ownership * 0.1
+        )
+
+        # Threshold gate
+        if self.proof_response.score < PROOF_THRESHOLD:
+            self.proof_response.valid = False
+            self._append_error("SCORE_BELOW_THRESHOLD")
+
+        # attributes / metadata
+        self.proof_response.attributes = {
+            "files": file_stats,                # full per-file info
+            "errors": self.errors,
+        }
+        self.proof_response.metadata = {"schema_type": "netflix-csv"}
+
+        logging.info(f"⇢ proof complete: valid={self.proof_response.valid} "
+                     f"score={self.proof_response.score}")
         return self.proof_response
-        
-    def _verify_profile_match(self, google_user, input_data):
-        """
-        Verify that the input data matches the Google profile.
-        
-        Args:
-            google_user: The GoogleUserInfo object from the OAuth API
-            input_data: The input data from the JSON file
-            
-        Returns:
-            bool: True if the data matches, False otherwise
-        """
-        # Check userId matches Google user ID
-        if input_data.get('userId') != google_user.id:
-            logging.error(f"User ID mismatch: {input_data.get('userId')} != {google_user.id}")
-            return False
-            
-        # Check email matches Google email
-        if input_data.get('email') != google_user.email:
-            logging.error(f"Email mismatch: {input_data.get('email')} != {google_user.email}")
-            return False
-            
-        # Check profile name matches Google name if available
-        profile_name = input_data.get('profile', {}).get('name')
-        if profile_name and profile_name != google_user.name:
-            logging.error(f"Name mismatch: {profile_name} != {google_user.name}")
-            return False
-            
-        logging.info("Google profile verification successful")
-        return True
 
