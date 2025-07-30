@@ -5,4 +5,3 @@ web3
 psycopg2-binary
 sqlalchemy
 pandas
-cryptography
